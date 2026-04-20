@@ -2,6 +2,7 @@
 """Battery Report Tool – service team battery diagnostic for Linux."""
 
 import csv
+import io
 import subprocess
 import sys
 from datetime import datetime
@@ -10,6 +11,7 @@ from pathlib import Path
 import pyqtgraph as pg
 from PySide6.QtCore import QPoint, QRect, Qt, QTimer
 from PySide6.QtGui import QFont, QPainter, QPageSize, QPdfWriter
+from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -66,6 +68,26 @@ def parse_battery(text: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Device info
+# ---------------------------------------------------------------------------
+
+
+def get_device_info() -> dict:
+    """Collect device model and serial number from DMI sysfs (readable without root)."""
+    try:
+        vendor = Path("/sys/class/dmi/id/sys_vendor").read_text().strip()
+        product = Path("/sys/class/dmi/id/product_name").read_text().strip()
+        model = f"{vendor} {product}"
+    except OSError:
+        model = "Unknown"
+    try:
+        serial = Path("/sys/class/dmi/id/product_serial").read_text().strip()
+    except OSError:
+        serial = "Unknown"
+    return {"model": model, "serial": serial}
+
+
+# ---------------------------------------------------------------------------
 # Custom time axis
 # ---------------------------------------------------------------------------
 
@@ -116,6 +138,8 @@ class MainWindow(QMainWindow):
         self._energy_fd: list[float] = []
         self._voltage: list[float] = []
 
+        self._device_info = get_device_info()
+
         self._build_ui()
         self._timer.start()
 
@@ -140,6 +164,12 @@ class MainWindow(QMainWindow):
             row.addWidget(lbl)
         row.addStretch()
         vbox.addLayout(row)
+
+        # Device info row
+        self._lbl_device_info = QLabel(
+            f"Device: {self._device_info['model']}   S/N: {self._device_info['serial']}"
+        )
+        vbox.addWidget(self._lbl_device_info)
 
         # Button row
         btn_row = QHBoxLayout()
@@ -228,6 +258,8 @@ class MainWindow(QMainWindow):
         ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         csv_path = SCRIPT_DIR / f"batreport_{ts}.csv"
         self._csv_file = open(csv_path, "w", newline="")
+        self._csv_file.write(f"# model: {self._device_info['model']}\n")
+        self._csv_file.write(f"# serial: {self._device_info['serial']}\n")
         self._csv_writer = csv.writer(self._csv_file)
         self._csv_writer.writerow([
             "datetime", "elapsed_s", "percentage",
@@ -275,15 +307,34 @@ class MainWindow(QMainWindow):
 
         try:
             with open(path, newline="") as f:
-                reader = csv.DictReader(f)
-                last_row = None
-                for row in reader:
-                    self._t.append(float(row["elapsed_s"]))
-                    self._pct.append(float(row["percentage"]))
-                    self._energy.append(float(row["energy_wh"]))
-                    self._energy_fd.append(float(row["energy_full_design_wh"]))
-                    self._voltage.append(float(row["voltage_v"]))
-                    last_row = row
+                raw_lines = f.readlines()
+
+            # Parse # metadata comment lines
+            meta: dict = {}
+            data_lines = []
+            for line in raw_lines:
+                if line.startswith("# "):
+                    key, _, val = line[2:].partition(": ")
+                    meta[key.strip()] = val.strip()
+                else:
+                    data_lines.append(line)
+
+            if meta:
+                self._device_info["model"] = meta.get("model", "Unknown")
+                self._device_info["serial"] = meta.get("serial", "Unknown")
+                self._lbl_device_info.setText(
+                    f"Device: {self._device_info['model']}   S/N: {self._device_info['serial']}"
+                )
+
+            reader = csv.DictReader(io.StringIO("".join(data_lines)))
+            last_row = None
+            for row in reader:
+                self._t.append(float(row["elapsed_s"]))
+                self._pct.append(float(row["percentage"]))
+                self._energy.append(float(row["energy_wh"]))
+                self._energy_fd.append(float(row["energy_full_design_wh"]))
+                self._voltage.append(float(row["voltage_v"]))
+                last_row = row
         except Exception as exc:
             print(f"CSV load error: {exc}", file=sys.stderr)
             return
@@ -320,25 +371,40 @@ class MainWindow(QMainWindow):
         pw = page_rect.width()
         ph = page_rect.height()
 
-        # Header
+        pad = ph // 10  # 10% of page height as vertical padding
+
+        # Logo
+        svg = QSvgRenderer(str(SCRIPT_DIR / "logo.svg"))
+        logo_natural = svg.defaultSize()
+        logo_h = 80
+        logo_w = logo_natural.width() * logo_h // logo_natural.height() if logo_natural.height() > 0 else logo_h
+        logo_x = (pw - logo_w) // 2
+        svg.render(painter, QRect(logo_x, 0, logo_w, logo_h))
+
+        # Header text
         font = QFont("Arial", 14)
         font.setBold(True)
         painter.setFont(font)
-        painter.drawText(0, 50, f"Battery Report — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        painter.drawText(0, logo_h + pad - 30, f"Battery Report — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-        header_h = 80
-        gap = 20
-        available_h = ph - header_h - gap
+        font2 = QFont("Arial", 10)
+        painter.setFont(font2)
+        painter.drawText(0, logo_h + pad, f"Device: {self._device_info['model']}   S/N: {self._device_info['serial']}")
+
+        header_h = logo_h + pad + 30  # bottom of info text + small margin
 
         img1 = self._plot1.grab().toImage()
         img2 = self._plot2.grab().toImage()
+
+        # Available height for both graphs with one pad gap between them and pad at bottom
+        available_h = ph - header_h - pad - pad
 
         # Phase 1: scale each image to full page width, preserving aspect ratio
         w1, h1 = pw, img1.height() * pw // img1.width()
         w2, h2 = pw, img2.height() * pw // img2.width()
 
         # Phase 2: if combined height exceeds available space, scale both down uniformly
-        total_h = h1 + gap + h2
+        total_h = h1 + h2
         if total_h > available_h:
             ratio = available_h / total_h
             w1 = int(w1 * ratio)
@@ -351,7 +417,7 @@ class MainWindow(QMainWindow):
         x2 = (pw - w2) // 2
 
         painter.drawImage(QRect(x1, header_h, w1, h1), img1)
-        painter.drawImage(QRect(x2, header_h + h1 + gap, w2, h2), img2)
+        painter.drawImage(QRect(x2, header_h + h1 + pad, w2, h2), img2)
 
         painter.end()
 

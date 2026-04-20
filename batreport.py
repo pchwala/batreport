@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 
 import pyqtgraph as pg
-from PySide6.QtCore import QRect, Qt, QTimer
+from PySide6.QtCore import QPoint, QRect, Qt, QTimer
 from PySide6.QtGui import QFont, QPainter, QPageSize, QPdfWriter
 from PySide6.QtWidgets import (
     QApplication,
@@ -134,8 +134,9 @@ class MainWindow(QMainWindow):
         self._lbl_state = QLabel("State: —")
         self._lbl_pct = QLabel("Charge: —")
         self._lbl_energy = QLabel("Energy: —")
+        self._lbl_efd = QLabel("Design cap: —")
         self._lbl_voltage = QLabel("Voltage: —")
-        for lbl in (self._lbl_state, self._lbl_pct, self._lbl_energy, self._lbl_voltage):
+        for lbl in (self._lbl_state, self._lbl_pct, self._lbl_energy, self._lbl_efd, self._lbl_voltage):
             row.addWidget(lbl)
         row.addStretch()
         vbox.addLayout(row)
@@ -181,15 +182,10 @@ class MainWindow(QMainWindow):
         legend1 = self._plot1.addLegend(offset=(10, 10))
         self._curve_pct = self._plot1.plot(pen=pg.mkPen("g", width=2), name="Percentage %")
         self._curve_energy = pg.PlotCurveItem(pen=pg.mkPen("c", width=2))
-        self._curve_efd = pg.PlotCurveItem(
-            pen=pg.mkPen((255, 165, 0), width=1, style=Qt.PenStyle.DashLine)
-        )
         self._vb2.addItem(self._curve_energy)
-        self._vb2.addItem(self._curve_efd)
         legend1.addItem(self._curve_energy, "Energy Wh")
-        legend1.addItem(self._curve_efd, "Energy-Full-Design Wh")
 
-        vbox.addWidget(self._plot1, stretch=3)
+        vbox.addWidget(self._plot1, stretch=1)
 
         # ---- Graph 2: Voltage ----
         self._plot2 = pg.PlotWidget(
@@ -202,7 +198,7 @@ class MainWindow(QMainWindow):
         self._plot2.addLegend(offset=(10, 10))
         self._curve_voltage = self._plot2.plot(pen=pg.mkPen("y", width=2), name="Voltage V")
 
-        vbox.addWidget(self._plot2, stretch=2)
+        vbox.addWidget(self._plot2, stretch=1)
 
         self.resize(900, 700)
 
@@ -294,13 +290,13 @@ class MainWindow(QMainWindow):
 
         self._curve_pct.setData(self._t, self._pct)
         self._curve_energy.setData(self._t, self._energy)
-        self._curve_efd.setData(self._t, self._energy_fd)
         self._curve_voltage.setData(self._t, self._voltage)
 
         if last_row:
             self._lbl_state.setText(f"State: {last_row.get('state', '—')}")
             self._lbl_pct.setText(f"Charge: {float(last_row['percentage']):.1f}%")
             self._lbl_energy.setText(f"Energy: {float(last_row['energy_wh']):.3f} Wh")
+            self._lbl_efd.setText(f"Design cap: {float(last_row['energy_full_design_wh']):.3f} Wh")
             self._lbl_voltage.setText(f"Voltage: {float(last_row['voltage_v']):.3f} V")
 
         self._loaded = True
@@ -331,15 +327,31 @@ class MainWindow(QMainWindow):
         painter.drawText(0, 50, f"Battery Report — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
         header_h = 80
-        remaining_h = ph - header_h - 20
-        plot1_h = int(remaining_h * 0.55)
-        plot2_h = int(remaining_h * 0.40)
+        gap = 20
+        available_h = ph - header_h - gap
 
         img1 = self._plot1.grab().toImage()
-        painter.drawImage(QRect(0, header_h, pw, plot1_h), img1, img1.rect())
-
         img2 = self._plot2.grab().toImage()
-        painter.drawImage(QRect(0, header_h + plot1_h + 20, pw, plot2_h), img2, img2.rect())
+
+        # Phase 1: scale each image to full page width, preserving aspect ratio
+        w1, h1 = pw, img1.height() * pw // img1.width()
+        w2, h2 = pw, img2.height() * pw // img2.width()
+
+        # Phase 2: if combined height exceeds available space, scale both down uniformly
+        total_h = h1 + gap + h2
+        if total_h > available_h:
+            ratio = available_h / total_h
+            w1 = int(w1 * ratio)
+            h1 = int(h1 * ratio)
+            w2 = int(w2 * ratio)
+            h2 = int(h2 * ratio)
+
+        # Centre horizontally if narrower than page width (after phase 2 scale-down)
+        x1 = (pw - w1) // 2
+        x2 = (pw - w2) // 2
+
+        painter.drawImage(QRect(x1, header_h, w1, h1), img1)
+        painter.drawImage(QRect(x2, header_h + h1 + gap, w2, h2), img2)
 
         painter.end()
 
@@ -369,6 +381,7 @@ class MainWindow(QMainWindow):
         self._lbl_state.setText(f"State: {state}")
         self._lbl_pct.setText(f"Charge: {pct:.1f}%")
         self._lbl_energy.setText(f"Energy: {energy:.3f} Wh")
+        self._lbl_efd.setText(f"Design cap: {efd:.3f} Wh")
         self._lbl_voltage.setText(f"Voltage: {voltage:.3f} V")
 
         if not self._recording:
@@ -392,7 +405,6 @@ class MainWindow(QMainWindow):
 
         self._curve_pct.setData(self._t, self._pct)
         self._curve_energy.setData(self._t, self._energy)
-        self._curve_efd.setData(self._t, self._energy_fd)
         self._curve_voltage.setData(self._t, self._voltage)
 
     # ------------------------------------------------------------------
